@@ -1,7 +1,5 @@
 # Elite JS
 
-![Elite JS](https://via.placeholder.com/800x400?text=Elite+JS+Screenshot)
-
 ## A Modern JavaScript Recreation of the Classic Elite Space Trading Game
 
 Elite JS is an open-source fan project inspired by the legendary 1984 space trading game Elite, using modern web technologies. Built with JavaScript and Three.js, this project aims to capture the magic of the original while making it accessible to a new generation of players directly in their browsers. 
