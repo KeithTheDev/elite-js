@@ -4,7 +4,9 @@
 
 ## A Modern JavaScript Recreation of the Classic Elite Space Trading Game
 
-Elite JS is an open-source reimplementation of the legendary 1984 space trading game Elite, using modern web technologies. Built with JavaScript and Three.js, this project aims to capture the magic of the original while making it accessible to a new generation of players directly in their browsers.
+Elite JS is an open-source fan project inspired by the legendary 1984 space trading game Elite, using modern web technologies. Built with JavaScript and Three.js, this project aims to capture the magic of the original while making it accessible to a new generation of players directly in their browsers. 
+
+**DISCLAIMER**: This is an unofficial fan project not affiliated with, endorsed by, or connected to David Braben, Ian Bell, Frontier Developments, or any other rights holders of the Elite franchise.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 ![Status](https://img.shields.io/badge/Status-In%20Development-blue)
@@ -157,4 +159,4 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ---
 
-*Elite JS is a fan project and is not affiliated with or endorsed by the creators of the original Elite game.*
+*Elite JS is a fan project and is not affiliated with or endorsed by the creators of the original Elite game. All original game concepts, ship designs, and the Elite name are the property of their respective owners. This project is created out of appreciation for the original work and is intended for educational and non-commercial purposes.*
