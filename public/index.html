@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Elite JS</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div id="game-container" tabindex="0">
+        <div id="three-canvas"></div>
+        <div id="ui-overlay">
+            <div id="speed-indicator">Speed: 0</div>
+            <div id="shields-indicator">Shields: Fore 255, Aft 255</div>
+            <div id="scanner">
+                <div id="scanner-box"></div>
+                <div id="scanner-dot"></div>
+            </div>
+            <!-- Target crosshairs for the laser sight -->
+            <div id="crosshair">
+                <div class="crosshair-line horizontal"></div>
+                <div class="crosshair-line vertical"></div>
+                <div class="crosshair-circle"></div>
+            </div>
+            <div id="market"></div>
+            <div id="inventory"></div>
+            <div id="status"></div>
+        </div>
+        <div id="loading-screen">
+            <div id="loading-text">Loading Elite JS...</div>
+            <div id="loading-bar">
+                <div id="loading-bar-fill"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- External libraries -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    
+    <!-- Game files -->
+    <script src="js/blueprints.js"></script>
+    
+    <!-- Module loader and startup -->
+    <script type="module">
+        // Import main module
+        import { initGame } from './js/main.js';
+        
+        // Loading simulation
+        window.addEventListener('load', () => {
+            const loadingBar = document.getElementById('loading-bar-fill');
+            const loadingScreen = document.getElementById('loading-screen');
+            
+            // Simulate loading progress
+            let progress = 0;
+            const interval = setInterval(() => {
+                progress += 5;
+                loadingBar.style.width = `${progress}%`;
+                
+                if (progress >= 100) {
+                    clearInterval(interval);
+                    setTimeout(() => {
+                        loadingScreen.style.display = 'none';
+                        // Initialize game
+                        initGame();
+                    }, 500);
+                }
+            }, 100);
+        });
+    </script>
+</body>
+</html>

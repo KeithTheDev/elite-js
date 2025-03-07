@@ -1,0 +1,2918 @@
+File: ./ai.js
+// ai.js - AI ship behavior
+
+import { fireLaser } from './combat.js';
+import { CONSTANTS } from './config.js';
+import { gameState } from './gameState.js';
+
+// Update AI ship behavior
+export function updateShipAI(ship, playerShip, deltaTime) {
+    if (!ship.userData.alive) return;
+
+    // Regenerate energy over time
+    ship.userData.energy = Math.min(
+        ship.userData.energy + 0.5 * deltaTime, 
+        ship.userData.maxEnergy
+    );
+
+    // Calculate distance to player
+    const distanceToPlayer = ship.position.distanceTo(playerShip.position);
+    
+    // State machine for AI behavior
+    switch (ship.userData.aiState) {
+        case 'idle':
+            updateIdleState(ship, playerShip, distanceToPlayer, deltaTime);
+            break;
+            
+        case 'attacking':
+            updateAttackingState(ship, playerShip, distanceToPlayer, deltaTime);
+            break;
+            
+        case 'fleeing':
+            updateFleeingState(ship, playerShip, distanceToPlayer, deltaTime);
+            break;
+    }
+    
+    // Make sure ships don't go too far from the player
+    if (distanceToPlayer > CONSTANTS.SHIP_RESPAWN_DISTANCE * 2) {
+        respawnShipNearPlayer(ship, playerShip);
+    }
+}
+
+// Update idle state behavior
+function updateIdleState(ship, playerShip, distanceToPlayer, deltaTime) {
+    // Random movement in idle state
+    ship.userData.rollRate = (Math.random() - 0.5) * Math.PI / 4;
+    ship.userData.pitchRate = (Math.random() - 0.5) * Math.PI / 4;
+    
+    // Random speed changes
+    if (Math.random() < 0.01) {
+        ship.userData.speed = Math.random() * ship.userData.maxSpeed * 0.5;
+    }
+    
+    // Chance to attack based on distance and random factor
+    if (distanceToPlayer < 500 && Math.random() < 0.005 && !gameState.get('docked')) {
+        ship.userData.aiState = 'attacking';
+        ship.userData.target = playerShip;
+        // console.log(`${ship.userData.type} is now attacking the player!`);
+    }
+}
+
+// Update attacking state behavior
+function updateAttackingState(ship, playerShip, distanceToPlayer, deltaTime) {
+    if (!ship.userData.target || !ship.userData.target.userData.alive || gameState.get('docked')) {
+        ship.userData.aiState = 'idle';
+        ship.userData.target = null;
+        return;
+    }
+    
+    const target = ship.userData.target;
+    
+    // Calculate direction to target
+    const targetPos = target.position.clone();
+    const directionToTarget = new THREE.Vector3().subVectors(targetPos, ship.position).normalize();
+    
+    // Calculate the current forward direction
+    const currentDirection = new THREE.Vector3(0, 0, -1).applyQuaternion(ship.quaternion);
+    
+    // Calculate angle between current direction and target direction
+    const angle = currentDirection.angleTo(directionToTarget);
+    
+    // If target is behind, perform evasive maneuvers
+    if (angle > Math.PI * 0.7) {
+        ship.userData.rollRate = Math.PI * (Math.random() > 0.5 ? 1 : -1);
+        ship.userData.pitchRate = Math.PI * 0.5 * (Math.random() - 0.5);
+        ship.userData.speed = Math.max(ship.userData.speed - 2 * deltaTime, ship.userData.maxSpeed * 0.3);
+    } else {
+        // Gradually orient towards target using SLERP-like behavior
+        ship.userData.rollRate = (Math.random() - 0.5) * Math.PI * 0.2;
+        
+        // Pitch up or down based on target position
+        const localTarget = directionToTarget.clone().applyQuaternion(ship.quaternion.clone().invert());
+        ship.userData.pitchRate = localTarget.y * Math.PI;
+        
+        // Adjust speed based on distance
+        if (distanceToPlayer > 200) {
+            ship.userData.speed = Math.min(ship.userData.speed + 2 * deltaTime, ship.userData.maxSpeed);
+        } else {
+            // Maintain distance
+            ship.userData.speed = Math.max(ship.userData.speed - deltaTime, ship.userData.maxSpeed * 0.5);
+        }
+        
+        // Fire lasers if in range and facing target
+        if (distanceToPlayer < 300 && angle < Math.PI * 0.2 && Math.random() < 0.05) {
+            fireLaser(ship, playerShip);
+        }
+    }
+    
+    // Small chance to give up pursuit
+    if (Math.random() < 0.001 || distanceToPlayer > 1000) {
+        ship.userData.aiState = 'idle';
+        ship.userData.target = null;
+    }
+    
+    // Check energy levels - flee if low
+    if (ship.userData.energy < ship.userData.maxEnergy * 0.2) {
+        ship.userData.aiState = 'fleeing';
+    }
+}
+
+// Update fleeing state behavior
+function updateFleeingState(ship, playerShip, distanceToPlayer, deltaTime) {
+    // Run away from player
+    const fleeDirection = new THREE.Vector3().subVectors(ship.position, playerShip.position).normalize();
+    ship.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, -1), fleeDirection);
+    ship.userData.speed = Math.min(ship.userData.speed + 5 * deltaTime, ship.userData.maxSpeed);
+    
+    // Return to idle if safe or energy recovered
+    if (distanceToPlayer > 800 || ship.userData.energy > ship.userData.maxEnergy * 0.6 || Math.random() < 0.01) {
+        ship.userData.aiState = 'idle';
+    }
+}
+
+// Respawn a ship near the player
+function respawnShipNearPlayer(ship, playerShip) {
+    const randomDirection = new THREE.Vector3(
+        Math.random() - 0.5,
+        Math.random() - 0.5,
+        Math.random() - 0.5
+    ).normalize();
+    
+    ship.position.copy(playerShip.position.clone().add(
+        randomDirection.multiplyScalar(CONSTANTS.SHIP_RESPAWN_DISTANCE + Math.random() * 500)
+    ));
+    
+    // Reset AI state
+    ship.userData.aiState = 'idle';
+    ship.userData.target = null;
+}
+File: ./combat.js
+// combat.js - Lasers, missiles, and combat logic
+
+import { playSound } from './audio.js';
+import { createExplosion } from './effects.js';
+import { gameState } from './gameState.js';
+import { addToScene, getCamera, getCurrentView, removeFromScene } from './rendering.js';
+import { getShips } from './ship.js';
+
+// Ensure THREE is available
+const THREE = window.THREE;
+
+// Lasers in the scene
+const lasers = [];
+
+// Missile targeting state
+let missileTargeting = false;
+
+// Fire a laser from a ship
+export function fireLaser(ship, playerShip) {
+    // Retrieve the camera once so it's available throughout the function
+    const camera = getCamera();
+    if (ship === playerShip && !camera) {
+        console.error("Camera not available for player laser");
+        return;
+    }
+
+    // Get laser power - handle both player and AI ships
+    let laserPower = 0;
+    if (ship === playerShip) {
+        // Player laser power depends on the current view
+        const currentView = getCurrentView();
+        laserPower = gameState.get('laserPower')[currentView] || 0;
+    } else {
+        laserPower = ship.userData.laserPower;
+    }
+    
+    // Check if can fire
+    if (laserPower <= 0) return;
+    if (ship === playerShip && gameState.get('energy') < 1) return;
+    if (ship !== playerShip && ship.userData.energy < 1) return;
+    
+    // Create laser beam based on whether it's player or AI ship
+    let laser;
+    
+    if (ship === playerShip) {
+        // For player, create laser beams from the center of the screen
+        // This is how the original Elite rendered player lasers
+        const viewDirection = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+        
+        // Create two parallel beams extending from screen center
+        // Left beam
+        const leftGeometry = new THREE.BufferGeometry();
+        const leftStart = new THREE.Vector3(-4, -2, -10);
+        leftStart.applyQuaternion(camera.quaternion).add(camera.position);
+        const leftEnd = leftStart.clone().add(viewDirection.clone().multiplyScalar(1000));
+        leftGeometry.setFromPoints([leftStart, leftEnd]);
+        
+        const leftMaterial = new THREE.LineBasicMaterial({ color: 0xFF0000 });
+        const leftLaser = new THREE.Line(leftGeometry, leftMaterial);
+        leftLaser.userData = {
+            lifetime: 0.1,
+            shooter: ship,
+            direction: viewDirection.clone()
+        };
+        addToScene(leftLaser);
+        lasers.push(leftLaser);
+        
+        // Right beam
+        const rightGeometry = new THREE.BufferGeometry();
+        const rightStart = new THREE.Vector3(4, -2, -10);
+        rightStart.applyQuaternion(camera.quaternion).add(camera.position);
+        const rightEnd = rightStart.clone().add(viewDirection.clone().multiplyScalar(1000));
+        rightGeometry.setFromPoints([rightStart, rightEnd]);
+        
+        const rightMaterial = new THREE.LineBasicMaterial({ color: 0xFF0000 });
+        const rightLaser = new THREE.Line(rightGeometry, rightMaterial);
+        rightLaser.userData = {
+            lifetime: 0.1,
+            shooter: ship,
+            direction: viewDirection.clone()
+        };
+        addToScene(rightLaser);
+        lasers.push(rightLaser);
+        
+        // For hit detection, we'll use the view direction
+        laser = rightLaser; // Use one of the lasers for hit detection
+    } else {
+        // For AI ships, create laser from the ship position
+        const start = new THREE.Vector3().copy(ship.position);
+        const direction = new THREE.Vector3(0, 0, -1).applyQuaternion(ship.quaternion);
+        const end = start.clone().add(direction.multiplyScalar(1000));
+        const geometry = new THREE.BufferGeometry().setFromPoints([start, end]);
+        
+        const material = new THREE.LineBasicMaterial({ color: 0xFF0000 });
+        laser = new THREE.Line(geometry, material);
+        laser.userData = {
+            lifetime: 0.1,
+            shooter: ship,
+            direction: direction.clone()
+        };
+        addToScene(laser);
+        lasers.push(laser);
+    }
+    
+    // Use energy
+    if (ship === playerShip) {
+        gameState.useEnergy(laserPower);
+    } else {
+        ship.userData.energy -= laserPower;
+    }
+    
+    // Play sound - different pitch for player vs enemy
+    const frequency = ship === playerShip ? 440 : 330;
+    playSound(frequency, 100);
+
+    // Hit detection section
+    const allShips = getShips();
+    const validTargets = allShips.filter(target => 
+        target !== ship && target.userData.alive
+    );
+    
+    if (ship !== playerShip && playerShip.userData.alive) {
+        validTargets.push(playerShip);
+    }
+    
+    // Use the correct direction for hit detection
+    const hitDirection = ship === playerShip 
+        ? new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion)
+        : laser.userData.direction;
+
+    validTargets.forEach(target => {
+        const targetPos = target.position.clone();
+        const distance = ship.position.distanceTo(targetPos);
+        
+        if (distance > 1000) return;
+        
+        const shipToTarget = targetPos.clone().sub(ship.position);
+        const projectionLength = shipToTarget.dot(hitDirection);
+        
+        if (projectionLength < 0) return;
+        
+        const closestPoint = ship.position.clone().add(
+            hitDirection.clone().multiplyScalar(projectionLength)
+        );
+        const missDistance = closestPoint.distanceTo(targetPos);
+        
+        if (missDistance < 30) {
+            const damage = laserPower * 10 * (1 - missDistance / 30);
+            damageShip(target, damage, ship === playerShip);
+            
+            const hitEffect = new THREE.Mesh(
+                new THREE.SphereGeometry(2),
+                new THREE.MeshBasicMaterial({ color: 0xffff00 })
+            );
+            hitEffect.position.copy(closestPoint);
+            addToScene(hitEffect);
+            setTimeout(() => removeFromScene(hitEffect), 100);
+        }
+    });
+}
+
+// Damage a ship
+export function damageShip(ship, amount, isFromPlayer = false) {
+    if (ship === gameState.playerShip) {
+        // For player, damage shields first, then energy
+        const shields = gameState.get('shields');
+        const shieldDamage = Math.min(shields.fore + shields.aft, amount);
+        amount -= shieldDamage;
+        
+        // Distribute shield damage
+        const foreDamage = Math.min(shields.fore, shieldDamage / 2);
+        const aftDamage = Math.min(shields.aft, shieldDamage / 2 + Math.max(0, shieldDamage / 2 - shields.fore));
+        
+        gameState.damageShields(foreDamage, aftDamage);
+        
+        // If damage remains, apply to energy
+        if (amount > 0) {
+            gameState.useEnergy(amount);
+            if (gameState.get('energy') <= 0) {
+                gameState.set('condition', 'DEAD');
+                playSound(50, 2000);
+                
+                // Respawn after a delay
+                setTimeout(() => {
+                    gameState.set('energy', 255);
+                    gameState.set('shields', { fore: 255, aft: 255 });
+                    gameState.playerShip.position.set(0, 0, 0);
+                    gameState.set('condition', 'GREEN');
+                }, 3000);
+            }
+        }
+    } else {
+        // For AI ships, damage energy directly
+        ship.userData.energy -= amount;
+        if (ship.userData.energy <= 0) {
+            ship.userData.alive = false;
+            
+            // Create explosion effect
+            createExplosion(ship.position, ship.userData.explosionCount || 30);
+            
+            // Remove ship after a delay
+            setTimeout(() => {
+                removeFromScene(ship);
+                const ships = getShips();
+                const index = ships.indexOf(ship);
+                if (index > -1) {
+                    ships.splice(index, 1);
+                    
+                    // Add bounty if applicable and shot by player
+                    if (isFromPlayer && ship.userData.bounty > 0) {
+                        gameState.addCash(ship.userData.bounty);
+                        
+                        // Display bounty message
+                        showBountyMessage(ship.userData.bounty);
+                    }
+                }
+            }, 1000);
+        }
+    }
+}
+
+// Show bounty message
+function showBountyMessage(amount) {
+    const bountyMessage = document.createElement('div');
+    bountyMessage.textContent = `Bounty: +${amount} CR`;
+    bountyMessage.style.position = 'absolute';
+    bountyMessage.style.top = '100px';
+    bountyMessage.style.left = '50%';
+    bountyMessage.style.transform = 'translateX(-50%)';
+    bountyMessage.style.color = '#ff0';
+    bountyMessage.style.fontFamily = 'monospace';
+    document.getElementById('ui-overlay').appendChild(bountyMessage);
+    
+    // Remove message after a few seconds
+    setTimeout(() => {
+        bountyMessage.remove();
+    }, 3000);
+}
+
+// Start missile targeting
+export function startMissileTargeting() {
+    if (gameState.get('missiles') > 0 && !missileTargeting) {
+        missileTargeting = true;
+        playSound(880, 200);
+        return true;
+    }
+    return false;
+}
+
+// Fire missile
+export function fireMissile() {
+    if (missileTargeting) {
+        gameState.fireMissile();
+        missileTargeting = false;
+        playSound(660, 300);
+        return true;
+    }
+    return false;
+}
+
+// Cancel missile targeting
+export function cancelMissileTargeting() {
+    if (missileTargeting) {
+        missileTargeting = false;
+        return true;
+    }
+    return false;
+}
+
+// Check if missile is targeting
+export function isMissileTargeting() {
+    return missileTargeting;
+}
+
+// Update all lasers
+export function updateLasers(deltaTime) {
+    for (let i = lasers.length - 1; i >= 0; i--) {
+        const laser = lasers[i];
+        laser.userData.lifetime -= deltaTime;
+        
+        if (laser.userData.lifetime <= 0) {
+            removeFromScene(laser);
+            lasers.splice(i, 1);
+        }
+    }
+}
+
+File: ./ui.js
+// ui.js - UI overlays and HUD
+
+import { isMissileTargeting } from './combat.js';
+import { galaxy, goods } from './config.js';
+import { gameState } from './gameState.js';
+import { generateMarket } from './trade.js';
+
+// UI element references
+let speedIndicator, shieldsIndicator, energyIndicator, missileIndicator;
+let marketPanel, inventoryPanel, statusPanel;
+
+// Track active panel
+let activePanel = null;
+
+// Initialize UI
+export function initUI() {
+    // Get UI element references
+    speedIndicator = document.getElementById('speed-indicator');
+    shieldsIndicator = document.getElementById('shields-indicator');
+    marketPanel = document.getElementById('market');
+    inventoryPanel = document.getElementById('inventory');
+    statusPanel = document.getElementById('status');
+    
+    // Create additional indicators if not present
+    createEnergyIndicator();
+    createMissileIndicator();
+    
+    // Add close buttons to panels
+    addCloseButtonsToAllPanels();
+    
+    // Position panels to avoid overlap
+    positionPanels();
+    
+    // Listen for game state changes
+    gameState.addListener((state, changedProperty) => {
+        updateUI(gameState, changedProperty);
+    });
+}
+
+// Create energy indicator if not exists
+function createEnergyIndicator() {
+    if (!document.getElementById('energy-indicator')) {
+        energyIndicator = document.createElement('div');
+        energyIndicator.id = 'energy-indicator';
+        energyIndicator.style.position = 'absolute';
+        energyIndicator.style.bottom = '60px';
+        energyIndicator.style.left = '20px';
+        document.getElementById('ui-overlay').appendChild(energyIndicator);
+    } else {
+        energyIndicator = document.getElementById('energy-indicator');
+    }
+}
+
+// Create missile indicator if not exists
+function createMissileIndicator() {
+    if (!document.getElementById('missile-indicator')) {
+        missileIndicator = document.createElement('div');
+        missileIndicator.id = 'missile-indicator';
+        missileIndicator.style.position = 'absolute';
+        missileIndicator.style.bottom = '80px';
+        missileIndicator.style.left = '20px';
+        document.getElementById('ui-overlay').appendChild(missileIndicator);
+    } else {
+        missileIndicator = document.getElementById('missile-indicator');
+    }
+}
+
+// Add close button to a panel
+function addCloseButton(panel, title) {
+    // Create panel header if doesn't exist
+    if (!panel.querySelector('.panel-header')) {
+        const header = document.createElement('div');
+        header.className = 'panel-header';
+        
+        // Add title
+        const titleElement = document.createElement('h2');
+        titleElement.textContent = title;
+        header.appendChild(titleElement);
+        
+        // Add close button
+        const closeButton = document.createElement('button');
+        closeButton.className = 'close-button';
+        closeButton.innerHTML = '✕';
+        closeButton.addEventListener('click', () => {
+            panel.style.display = 'none';
+            activePanel = null;
+        });
+        header.appendChild(closeButton);
+        
+        // Add header to panel
+        if (panel.firstChild) {
+            panel.insertBefore(header, panel.firstChild);
+        } else {
+            panel.appendChild(header);
+        }
+        
+        // Create content container
+        const content = document.createElement('div');
+        content.className = 'panel-content';
+        
+        // Move existing content to this container
+        while (panel.childNodes.length > 1) {
+            content.appendChild(panel.childNodes[1]);
+        }
+        
+        panel.appendChild(content);
+    }
+}
+
+// Add close buttons to all panels
+function addCloseButtonsToAllPanels() {
+    addCloseButton(marketPanel, 'Market');
+    addCloseButton(inventoryPanel, 'Inventory');
+    addCloseButton(statusPanel, 'Status');
+}
+
+// Position panels to avoid overlap
+function positionPanels() {
+    // Market panel (left side)
+    marketPanel.style.top = '50%';
+    marketPanel.style.left = '25%';
+    marketPanel.style.width = '300px';
+    marketPanel.style.maxHeight = '80vh';
+    
+    // Inventory panel (right side)
+    inventoryPanel.style.top = '50%';
+    inventoryPanel.style.left = '75%';
+    inventoryPanel.style.width = '300px';
+    inventoryPanel.style.maxHeight = '80vh';
+    
+    // Status panel (top)
+    statusPanel.style.top = '20%';
+    statusPanel.style.left = '50%';
+    statusPanel.style.width = '400px';
+}
+
+// Update UI elements
+export function updateUI(gameState, changedProperty) {
+    if (!changedProperty || changedProperty === 'speed') {
+        updateSpeedIndicator(gameState.playerShip); // Use gameState.playerShip
+    }
+    if (!changedProperty || changedProperty === 'shields') {
+        updateShieldsIndicator(gameState.get('shields')); // Use get('shields')
+    }
+    if (!changedProperty || changedProperty === 'energy') {
+        updateEnergyIndicator(gameState.get('energy')); // Use get('energy')
+    }
+    if (!changedProperty || changedProperty === 'missiles') {
+        updateMissileIndicator(gameState.get('missiles')); // Use get('missiles')
+    }
+}
+
+// Update speed indicator
+function updateSpeedIndicator(playerShip) {
+    if (speedIndicator && playerShip) {
+        speedIndicator.textContent = `Speed: ${playerShip.userData.speed.toFixed(1)}`;
+    }
+}
+
+// Update shields indicator
+function updateShieldsIndicator(shields) {
+    if (shieldsIndicator) {
+        shieldsIndicator.textContent = `Shields: Fore ${Math.floor(shields.fore)}, Aft ${Math.floor(shields.aft)}`;
+    }
+}
+
+// Update energy indicator
+function updateEnergyIndicator(energy) {
+    if (energyIndicator) {
+        energyIndicator.textContent = `Energy: ${Math.floor(energy)}`;
+    }
+}
+
+// Update missile indicator
+export function updateMissileIndicator(missiles) {
+    if (missileIndicator) {
+        missileIndicator.textContent = `Missiles: ${missiles}${isMissileTargeting() ? ' (ARMED)' : ''}`;
+    }
+}
+
+// Show market panel
+export function showMarketPanel() {
+    if (!marketPanel) return;
+    
+    // If another panel is showing, hide it
+    if (activePanel && activePanel !== marketPanel) {
+        activePanel.style.display = 'none';
+    }
+    
+    // Get market data
+    const market = generateMarket(gameState.get('currentSystem'));
+    const content = marketPanel.querySelector('.panel-content') || marketPanel;
+    
+    // Update market content
+    content.innerHTML = market.map((item, i) =>
+        `<div class="market-item">
+            <span class="item-name">${item.name}</span>
+            <span class="item-price">${item.price} CR/t</span>
+            <span class="item-avail">Stock: ${item.availability}</span>
+            <button onclick="window.buy(${i}, 1)">Buy 1</button>
+            <button onclick="window.buy(${i}, 5)">Buy 5</button>
+            <button onclick="window.buy(${i}, 10)">Buy 10</button>
+        </div>`
+    ).join('');
+    
+    // Add fuel purchase option
+    content.innerHTML += `
+        <div class="market-item fuel-section">
+            <h3>Fuel</h3>
+            <span>Price: ${gameState.get('fuel') / 10} LY available</span>
+            <button onclick="window.buyFuel(10)">Buy 1 LY</button>
+            <button onclick="window.buyFuel(30)">Buy 3 LY</button>
+            <button onclick="window.buyFuel(70)">Fill Tank</button>
+        </div>
+    `;
+    
+    marketPanel.style.display = 'block';
+    activePanel = marketPanel;
+}
+
+// Show inventory panel
+export function showInventoryPanel() {
+    if (!inventoryPanel) return;
+    
+    // If another panel is showing, hide it
+    if (activePanel && activePanel !== inventoryPanel) {
+        activePanel.style.display = 'none';
+    }
+    
+    const content = inventoryPanel.querySelector('.panel-content') || inventoryPanel;
+    
+    // Basic info
+    content.innerHTML = `
+        <div class="inventory-stats">
+            <div>Cash: ${gameState.get('cash').toFixed(1)} CR</div>
+            <div>Fuel: ${gameState.get('fuel') / 10} LY</div>
+            <div>Cargo Space: ${gameState.getTotalCargo()}/${gameState.get('cargoCapacity')}</div>
+        </div>
+    `;
+    
+    // Add cargo items
+    content.innerHTML += '<h3>Cargo</h3>';
+    content.innerHTML += goods.map((name, i) => {
+        const amount = gameState.get('cargo')[i];
+        if (amount <= 0) return ''; // Skip empty cargo
+        
+        return `
+            <div class="cargo-item">
+                <span class="item-name">${name}</span>
+                <span class="item-amount">${amount}t</span>
+                <button onclick="window.sell(${i}, 1)">Sell 1</button>
+                <button onclick="window.sell(${i}, 5)">Sell 5</button>
+                <button onclick="window.sell(${i}, ${amount})">Sell All</button>
+            </div>
+        `;
+    }).join('');
+    
+    inventoryPanel.style.display = 'block';
+    activePanel = inventoryPanel;
+}
+
+// Show status panel
+export function showStatusPanel() {
+    if (!statusPanel) return;
+    
+    // If another panel is showing, hide it
+    if (activePanel && activePanel !== statusPanel) {
+        activePanel.style.display = 'none';
+    }
+    
+    const content = statusPanel.querySelector('.panel-content') || statusPanel;
+    
+    content.innerHTML = `
+        <div class="status-section">
+            <h3>Commander Information</h3>
+            <div>Commander: Player</div>
+            <div>Rating: Harmless</div>
+            <div>Legal Status: Clean</div>
+        </div>
+        
+        <div class="status-section">
+            <h3>Ship Status</h3>
+            <div>Condition: ${gameState.get('condition')}</div>
+            <div>Cash: ${gameState.get('cash').toFixed(1)} CR</div>
+            <div>Fuel: ${gameState.get('fuel') / 10} LY</div>
+            <div>Cargo: ${gameState.getTotalCargo()}/${gameState.get('cargoCapacity')}</div>
+            <div>Missiles: ${gameState.get('missiles')}</div>
+        </div>
+        
+        <div class="status-section">
+            <h3>Navigation</h3>
+            <div>Present System: ${galaxy[gameState.get('currentSystem')].name}</div>
+            <div>Hyperspace Target: ${galaxy[gameState.get('hyperspaceSystem')].name}</div>
+            <div class="system-selector">
+                <h4>Select Hyperspace Target:</h4>
+                ${galaxy.map((system, i) => 
+                    `<button onclick="window.setHyperspaceSystem(${i})">${system.name}</button>`
+                ).join('')}
+            </div>
+        </div>
+    `;
+    
+    statusPanel.style.display = 'block';
+    activePanel = statusPanel;
+}
+
+// Toggle panel visibility
+export function togglePanel(panel) {
+    if (panel.style.display === 'block') {
+        panel.style.display = 'none';
+        activePanel = null;
+    } else {
+        if (activePanel) {
+            activePanel.style.display = 'none';
+        }
+        panel.style.display = 'block';
+        activePanel = panel;
+    }
+}
+
+// Hide all panels
+export function hidePanels() {
+    if (marketPanel) marketPanel.style.display = 'none';
+    if (inventoryPanel) inventoryPanel.style.display = 'none';
+    if (statusPanel) statusPanel.style.display = 'none';
+    activePanel = null;
+}
+
+// Show a notification message
+export function showNotification(message, color = '#fff', duration = 2000) {
+    const notification = document.createElement('div');
+    notification.textContent = message;
+    notification.style.position = 'absolute';
+    notification.style.top = '120px';
+    notification.style.left = '50%';
+    notification.style.transform = 'translateX(-50%)';
+    notification.style.color = color;
+    notification.style.fontFamily = 'monospace';
+    notification.style.background = 'rgba(0,0,0,0.7)';
+    notification.style.padding = '5px 10px';
+    notification.style.borderRadius = '3px';
+    notification.style.zIndex = '1000';
+    document.getElementById('ui-overlay').appendChild(notification);
+    
+    setTimeout(() => notification.remove(), duration);
+}
+
+// Update UI for hyperspace target
+export function updateHyperspaceTarget(index) {
+    showNotification(
+        `Hyperspace target: ${galaxy[index].name}`,
+        '#ff0',
+        2000
+    );
+}
+
+// Check if any panel is visible
+export function isPanelVisible() {
+    return activePanel !== null;
+}
+
+// Get active panel
+export function getActivePanel() {
+    return activePanel;
+}
+File: ./blueprints.js
+const shipBlueprints = {
+  "Sidewinder": {
+    vertices: [
+      [-32, 0, 36], [32, 0, 36], [64, 0, -28], [-64, 0, -28], [0, 16, -28],
+      [0, -16, -28], [-12, 6, -28], [12, 6, -28], [12, -6, -28], [-12, -6, -28]
+    ],
+    edges: [
+      [0, 1], [1, 2], [1, 4], [0, 4], [0, 3], [3, 4], [2, 4], [3, 5],
+      [2, 5], [1, 5], [0, 5], [6, 7], [7, 8], [6, 9], [8, 9]
+    ],
+    maxSpeed: 37,
+    energy: 70,
+    laserPower: 2,
+    missiles: 0,
+    bounty: 50,
+    visibilityDistance: 20,
+    explosionCount: 30
+  },
+
+  "Viper": {
+    vertices: [
+      [0, 0, 72], [0, 16, 24], [0, -16, 24], [48, 0, -24], [-48, 0, -24],
+      [24, -16, -24], [-24, -16, -24], [24, 16, -24], [-24, 16, -24], [-32, 0, -24],
+      [32, 0, -24], [8, 8, -24], [-8, 8, -24], [-8, -8, -24], [8, -8, -24]
+    ],
+    edges: [
+      [0, 3], [0, 1], [0, 2], [0, 4], [1, 7], [1, 8], [2, 5], [2, 6],
+      [7, 8], [5, 6], [4, 8], [4, 6], [3, 7], [3, 5], [9, 12], [9, 13],
+      [10, 11], [10, 14], [11, 14], [12, 13]
+    ],
+    maxSpeed: 32,
+    energy: 120,
+    laserPower: 2,
+    missiles: 1,
+    bounty: 0,
+    visibilityDistance: 23,
+    explosionCount: 42
+  },
+
+  "Mamba": {
+    vertices: [
+      [0, 0, 64], [-64, -8, -32], [-32, 8, -32], [32, 8, -32], [64, -8, -32],
+      [-4, 4, 16], [4, 4, 16], [8, 3, 28], [-8, 3, 28], [-20, -4, 16],
+      [20, -4, 16], [-24, -7, -20], [-16, -7, -20], [16, -7, -20], [24, -7, -20],
+      [-8, 4, -32], [8, 4, -32], [8, -4, -32], [-8, -4, -32], [-32, 4, -32],
+      [32, 4, -32], [36, -4, -32], [-36, -4, -32], [-38, 0, -32], [38, 0, -32]
+    ],
+    edges: [
+      [0, 1], [0, 4], [1, 4], [1, 2], [2, 3], [3, 4], [5, 6], [6, 7],
+      [7, 8], [5, 8], [9, 11], [9, 12], [10, 13], [10, 14], [13, 14],
+      [11, 12], [15, 16], [17, 18], [15, 18], [16, 17], [20, 21],
+      [20, 24], [21, 24], [19, 22], [19, 23], [22, 23], [0, 2], [0, 3]
+    ],
+    maxSpeed: 30,
+    energy: 90,
+    laserPower: 2,
+    missiles: 2,
+    bounty: 150,
+    visibilityDistance: 25,
+    explosionCount: 34
+  },
+
+  "Python": {
+    vertices: [
+      [0, 0, 224], [0, 48, 48], [96, 0, -16], [-96, 0, -16], [0, 48, -32],
+      [0, 24, -112], [-48, 0, -112], [48, 0, -112], [0, -48, 48], [0, -48, -32],
+      [0, -24, -112]
+    ],
+    edges: [
+      [0, 8], [0, 3], [0, 2], [0, 1], [2, 4], [1, 2], [2, 8], [1, 3],
+      [3, 8], [2, 9], [3, 4], [3, 9], [3, 5], [3, 10], [2, 5], [2, 10],
+      [2, 7], [3, 6], [5, 6], [5, 7], [7, 10], [6, 10], [4, 5], [9, 10],
+      [1, 4], [8, 9]
+    ],
+    maxSpeed: 20,
+    energy: 250,
+    laserPower: 3,
+    missiles: 3,
+    bounty: 200,
+    visibilityDistance: 40,
+    explosionCount: 46
+  },
+
+  "Cobra Mk III (Bounty Hunter)": {
+    vertices: [
+      [32, 0, 76], [-32, 0, 76], [0, 26, 24], [-120, -3, -8], [120, -3, -8],
+      [-88, 16, -40], [88, 16, -40], [128, -8, -40], [-128, -8, -40], [0, 26, -40],
+      [-32, -24, -40], [32, -24, -40], [-36, 8, -40], [-8, 12, -40], [8, 12, -40],
+      [36, 8, -40], [36, -12, -40], [8, -16, -40], [-8, -16, -40], [-36, -12, -40],
+      [0, 0, 76], [0, 0, 90], [-80, -6, -40], [-80, 6, -40], [-88, 0, -40],
+      [80, 6, -40], [88, 0, -40], [80, -6, -40]
+    ],
+    edges: [
+      [0, 1], [0, 4], [1, 3], [3, 8], [4, 7], [6, 7], [6, 9], [5, 9], [5, 8],
+      [2, 5], [2, 6], [3, 5], [4, 6], [1, 2], [0, 2], [8, 10], [10, 11], [7, 11],
+      [1, 10], [0, 11], [1, 5], [0, 6], [20, 21], [12, 13], [18, 19], [14, 15],
+      [16, 17], [15, 16], [14, 17], [13, 18], [12, 19], [2, 9], [22, 24], [23, 24],
+      [22, 23], [25, 26], [26, 27], [25, 27]
+    ],
+    maxSpeed: 28,
+    energy: 150,
+    laserPower: 2,
+    missiles: 3,
+    bounty: 0,
+    visibilityDistance: 50,
+    explosionCount: 42
+  },
+
+  "Cobra Mk III (Trader)": {
+    vertices: [
+      [32, 0, 76], [-32, 0, 76], [0, 26, 24], [-120, -3, -8], [120, -3, -8],
+      [-88, 16, -40], [88, 16, -40], [128, -8, -40], [-128, -8, -40], [0, 26, -40],
+      [-32, -24, -40], [32, -24, -40], [-36, 8, -40], [-8, 12, -40], [8, 12, -40],
+      [36, 8, -40], [36, -12, -40], [8, -16, -40], [-8, -16, -40], [-36, -12, -40],
+      [0, 0, 76], [0, 0, 90], [-80, -6, -40], [-80, 6, -40], [-88, 0, -40],
+      [80, 6, -40], [88, 0, -40], [80, -6, -40]
+    ],
+    edges: [
+      [0, 1], [0, 4], [1, 3], [3, 8], [4, 7], [6, 7], [6, 9], [5, 9], [5, 8],
+      [2, 5], [2, 6], [3, 5], [4, 6], [1, 2], [0, 2], [8, 10], [10, 11], [7, 11],
+      [1, 10], [0, 11], [1, 5], [0, 6], [20, 21], [12, 13], [18, 19], [14, 15],
+      [16, 17], [15, 16], [14, 17], [13, 18], [12, 19], [2, 9], [22, 24], [23, 24],
+      [22, 23], [25, 26], [26, 27], [25, 27]
+    ],
+    maxSpeed: 28,
+    energy: 150,
+    laserPower: 2,
+    missiles: 3,
+    bounty: 0,
+    visibilityDistance: 50,
+    explosionCount: 42
+  },
+
+  "Thargoid": {
+    vertices: [
+      [32, -48, 48], [32, -68, 0], [32, -48, -48], [32, 0, -68], [32, 48, -48],
+      [32, 68, 0], [32, 48, 48], [32, 0, 68], [-24, -116, 116], [-24, -164, 0],
+      [-24, -116, -116], [-24, 0, -164], [-24, 116, -116], [-24, 164, 0],
+      [-24, 116, 116], [-24, 0, 164], [-24, 64, 80], [-24, 64, -80],
+      [-24, -64, -80], [-24, -64, 80]
+    ],
+    edges: [
+      [0, 7], [0, 1], [1, 2], [2, 3], [3, 4], [4, 5], [5, 6], [6, 7],
+      [0, 8], [1, 9], [2, 10], [3, 11], [4, 12], [5, 13], [6, 14], [7, 15],
+      [8, 15], [8, 9], [9, 10], [10, 11], [11, 12], [12, 13], [13, 14], [14, 15],
+      [16, 17], [18, 19]
+    ],
+    maxSpeed: 39,
+    energy: 240,
+    laserPower: 2,
+    missiles: 6,
+    bounty: 500,
+    visibilityDistance: 55,
+    explosionCount: 38
+  },
+
+  "Coriolis": {
+    vertices: [
+      [160, 0, 160], [0, 160, 160], [-160, 0, 160], [0, -160, 160], [160, -160, 0],
+      [160, 160, 0], [-160, 160, 0], [-160, -160, 0], [160, 0, -160], [0, 160, -160],
+      [-160, 0, -160], [0, -160, -160], [10, -30, 160], [10, 30, 160], [-10, 30, 160],
+      [-10, -30, 160]
+    ],
+    edges: [
+      [0, 3], [0, 1], [1, 2], [2, 3], [3, 4], [0, 4], [0, 5], [5, 1],
+      [1, 6], [2, 6], [2, 7], [3, 7], [8, 11], [8, 9], [9, 10], [10, 11],
+      [4, 11], [4, 8], [5, 8], [5, 9], [6, 9], [6, 10], [7, 10], [7, 11],
+      [12, 13], [13, 14], [14, 15], [15, 12]
+    ],
+    maxSpeed: 0,
+    energy: 240,
+    laserPower: 0,
+    missiles: 6,
+    bounty: 0,
+    visibilityDistance: 120,
+    explosionCount: 54
+  },
+
+  "Missile": {
+    vertices: [
+      [0, 0, 68], [8, -8, 36], [8, 8, 36], [-8, 8, 36], [-8, -8, 36],
+      [8, 8, -44], [8, -8, -44], [-8, -8, -44], [-8, 8, -44], [12, 12, -44],
+      [12, -12, -44], [-12, -12, -44], [-12, 12, -44], [-8, 8, -12], [-8, -8, -12],
+      [8, 8, -12], [8, -8, -12]
+    ],
+    edges: [
+      [0, 1], [0, 2], [0, 3], [0, 4], [1, 2], [1, 4], [3, 4], [2, 3],
+      [2, 5], [1, 6], [4, 7], [3, 8], [7, 8], [5, 8], [5, 6], [6, 7],
+      [6, 10], [5, 9], [8, 12], [7, 11], [9, 15], [10, 16], [12, 13], [11, 14]
+    ],
+    maxSpeed: 44,
+    energy: 2,
+    laserPower: 0,
+    missiles: 0,
+    bounty: 0,
+    visibilityDistance: 14,
+    explosionCount: 10
+  },
+
+  "Asteroid": {
+    vertices: [
+      [0, 80, 0], [-80, -10, 0], [0, -80, 0], [70, -40, 0], [60, 50, 0],
+      [50, 0, 60], [-40, 0, 70], [0, 30, -75], [0, -50, -60]
+    ],
+    edges: [
+      [0, 1], [0, 4], [3, 4], [2, 3], [1, 2], [1, 6], [2, 6], [2, 5],
+      [5, 6], [0, 5], [3, 5], [0, 6], [4, 5], [1, 8], [1, 7], [0, 7],
+      [4, 7], [3, 7], [3, 8], [2, 8], [7, 8]
+    ],
+    maxSpeed: 30,
+    energy: 60,
+    laserPower: 0,
+    missiles: 0,
+    bounty: 5,
+    visibilityDistance: 50,
+    explosionCount: 34
+  },
+
+  "Cargo Canister": {
+    vertices: [
+      [24, 16, 0], [24, 5, 15], [24, -13, 9], [24, -13, -9], [24, 5, -15],
+      [-24, 16, 0], [-24, 5, 15], [-24, -13, 9], [-24, -13, -9], [-24, 5, -15]
+    ],
+    edges: [
+      [0, 1], [1, 2], [2, 3], [3, 4], [0, 4], [0, 5], [1, 6], [2, 7],
+      [3, 8], [4, 9], [5, 6], [6, 7], [7, 8], [8, 9], [9, 5]
+    ],
+    maxSpeed: 15,
+    energy: 17,
+    laserPower: 0,
+    missiles: 0,
+    bounty: 0,
+    visibilityDistance: 12,
+    explosionCount: 18
+  },
+
+  "Thargon": {
+    vertices: [
+      [-9, 0, 40], [-9, -38, 12], [-9, -24, -32], [-9, 24, -32], [-9, 38, 12],
+      [9, 0, -8], [9, -10, -15], [9, -6, -26], [9, 6, -26], [9, 10, -15]
+    ],
+    edges: [
+      [0, 1], [1, 2], [2, 3], [3, 4], [0, 4], [0, 5], [1, 6], [2, 7],
+      [3, 8], [4, 9], [5, 6], [6, 7], [7, 8], [8, 9], [9, 5]
+    ],
+    maxSpeed: 30,
+    energy: 20,
+    laserPower: 2,
+    missiles: 0,
+    bounty: 50,
+    visibilityDistance: 20,
+    explosionCount: 18
+  },
+
+  "Escape Pod": {
+    vertices: [
+      [-7, 0, 36], [-7, -14, -12], [-7, 14, -12], [21, 0, 0]
+    ],
+    edges: [
+      [0, 1], [1, 2], [2, 3], [3, 0], [0, 2], [3, 1]
+    ],
+    maxSpeed: 8,
+    energy: 17,
+    laserPower: 0,
+    missiles: 0,
+    bounty: 0,
+    visibilityDistance: 8,
+    explosionCount: 22
+  }
+};
+
+// Make shipBlueprints globally available
+window.shipBlueprints = shipBlueprints;
+File: ./gameState.js
+// gameState.js - Game state management
+
+import { galaxy } from './config.js';
+
+// Initial game state
+const initialState = {
+    docked: true,
+    condition: 'DOCKED',
+    cash: 100,
+    fuel: 70, // 7 LY * 10
+    cargo: Array(17).fill(0), // 17 trade goods
+    cargoCapacity: 20,
+    shields: { fore: 255, aft: 255 },
+    energy: 255,
+    missiles: 3,
+    laserPower: { front: 2, rear: 0, left: 0, right: 0 },
+    currentSystem: 0, // Index in galaxy
+    hyperspaceSystem: 0
+};
+
+// Create game state with getters and setters
+class GameState {
+    constructor() {
+        this._state = { ...initialState };
+        this._listeners = [];
+    }
+
+    // Reset the game state
+    reset() {
+        this._state = { ...initialState };
+        this._notifyListeners();
+    }
+
+    // Get a property from the state
+    get(property) {
+        return this._state[property];
+    }
+
+    // Set a property in the state
+    set(property, value) {
+        this._state[property] = value;
+        this._notifyListeners(property);
+    }
+
+    // Direct access to all properties (use sparingly)
+    get state() {
+        return this._state;
+    }
+
+    // Add a listener for state changes
+    addListener(callback) {
+        this._listeners.push(callback);
+    }
+
+    // Remove a listener
+    removeListener(callback) {
+        this._listeners = this._listeners.filter(listener => listener !== callback);
+    }
+
+    // Notify all listeners of state changes
+    _notifyListeners(changedProperty) {
+        this._listeners.forEach(listener => listener(this._state, changedProperty));
+    }
+
+    // Helper methods for common state changes
+    dock() {
+        this._state.docked = true;
+        this._state.condition = 'DOCKED';
+        this._notifyListeners('docked');
+    }
+
+    launch() {
+        this._state.docked = false;
+        this._state.condition = 'GREEN';
+        this._notifyListeners('docked');
+    }
+
+    addCash(amount) {
+        this._state.cash += amount;
+        this._notifyListeners('cash');
+    }
+
+    subtractCash(amount) {
+        this._state.cash -= amount;
+        this._notifyListeners('cash');
+    }
+
+    setCurrentSystem(index) {
+        if (index >= 0 && index < galaxy.length) {
+            this._state.currentSystem = index;
+            this._notifyListeners('currentSystem');
+        }
+    }
+
+    setHyperspaceSystem(index) {
+        if (index >= 0 && index < galaxy.length) {
+            this._state.hyperspaceSystem = index;
+            this._notifyListeners('hyperspaceSystem');
+        }
+    }
+
+    // Cargo methods
+    addCargo(goodIndex, amount) {
+        if (goodIndex >= 0 && goodIndex < this._state.cargo.length) {
+            this._state.cargo[goodIndex] += amount;
+            this._notifyListeners('cargo');
+        }
+    }
+
+    removeCargo(goodIndex, amount) {
+        if (goodIndex >= 0 && goodIndex < this._state.cargo.length &&
+            this._state.cargo[goodIndex] >= amount) {
+            this._state.cargo[goodIndex] -= amount;
+            this._notifyListeners('cargo');
+        }
+    }
+
+    getTotalCargo() {
+        return this._state.cargo.reduce((total, amount) => total + amount, 0);
+    }
+
+    getAvailableCargoSpace() {
+        return this._state.cargoCapacity - this.getTotalCargo();
+    }
+
+    // Energy and shields
+    damageShields(foreDamage, aftDamage) {
+        this._state.shields.fore = Math.max(0, this._state.shields.fore - foreDamage);
+        this._state.shields.aft = Math.max(0, this._state.shields.aft - aftDamage);
+        this._notifyListeners('shields');
+    }
+
+    useEnergy(amount) {
+        this._state.energy = Math.max(0, this._state.energy - amount);
+        this._notifyListeners('energy');
+    }
+
+    regenShieldsAndEnergy(deltaTime, shieldRate, energyRate) {
+        if (this._state.shields.fore < 255) {
+            this._state.shields.fore = Math.min(255, this._state.shields.fore + shieldRate * deltaTime);
+        }
+        if (this._state.shields.aft < 255) {
+            this._state.shields.aft = Math.min(255, this._state.shields.aft + shieldRate * deltaTime);
+        }
+        if (this._state.energy < 255) {
+            this._state.energy = Math.min(255, this._state.energy + energyRate * deltaTime);
+        }
+        this._notifyListeners('energy');
+    }
+
+    // Fuel management
+    useFuel(amount) {
+        if (this._state.fuel >= amount) {
+            this._state.fuel -= amount;
+            this._notifyListeners('fuel');
+            return true;
+        }
+        return false;
+    }
+
+    addFuel(amount) {
+        this._state.fuel = Math.min(70, this._state.fuel + amount);
+        this._notifyListeners('fuel');
+    }
+
+    // Missile management
+    fireMissile() {
+        if (this._state.missiles > 0) {
+            this._state.missiles--;
+            this._notifyListeners('missiles');
+            return true;
+        }
+        return false;
+    }
+
+    addMissiles(amount) {
+        this._state.missiles += amount;
+        this._notifyListeners('missiles');
+    }
+}
+
+// Create and export a singleton instance
+export const gameState = new GameState();
+export default gameState;
+File: ./scanner.js
+// scanner.js - Scanner/radar functionality
+
+// Reference to the scanner dot element
+let scannerDot;
+
+// Initialize scanner
+export function initScanner() {
+    scannerDot = document.getElementById('scanner-dot');
+    return scannerDot;
+}
+
+// Update scanner dot position based on relative position between player and target
+export function updateScanner(playerShip, station) {
+    if (!scannerDot || !playerShip || !station) return;
+    
+    // Get the scanner element to determine its size
+    const scanner = document.getElementById('scanner-box');
+    if (!scanner) return;
+    
+    const scannerSize = scanner.offsetWidth;
+    const scannerCenter = scannerSize / 2;
+    const scaleFactor = scannerSize / 2.5; // Adjust for proper deflection scaling
+    
+    // Calculate direction from player to station in world space
+    const worldDirection = new THREE.Vector3().subVectors(station.position, playerShip.position);
+    
+    // Transform to ship's local coordinate system
+    const localDirection = worldDirection.clone().applyQuaternion(playerShip.quaternion.clone().invert());
+    
+    // Calculate the absolute Z value for projection (avoiding division by zero)
+    let zAbs = Math.abs(localDirection.z);
+    if (zAbs < 0.001) zAbs = 0.001;
+    
+    // Project to 2D screen space with perspective division
+    // The original Elite used this type of formula for projection
+    const projectionX = localDirection.x / zAbs;
+    const projectionY = localDirection.y / zAbs;
+    
+    // Scale and clamp to scanner bounds
+    const dotX = scannerCenter + (scaleFactor * Math.max(-1, Math.min(1, projectionX)));
+    const dotY = scannerCenter - (scaleFactor * Math.max(-1, Math.min(1, projectionY))); // Y is inverted in screen space
+    
+    // Position the dot
+    scannerDot.style.left = `${dotX}px`;
+    scannerDot.style.top = `${dotY}px`;
+    
+    // Change dot appearance based on whether target is in front or behind
+    const isInFront = localDirection.z > 0;
+    
+    if (isInFront) {
+        // Solid dot for target in front (solid green)
+        scannerDot.style.backgroundColor = '#0F0';
+        scannerDot.style.border = 'none';
+    } else {
+        // Hollow dot for target behind (hollow green)
+        scannerDot.style.backgroundColor = 'transparent';
+        scannerDot.style.border = '2px solid #0F0';
+    }
+}
+File: ./controls.js
+// controls.js - Input handling and controls
+
+import { controls as keyMap } from './config.js';
+
+// Ensure THREE is available
+const THREE = window.THREE;
+
+// Set of currently pressed keys
+const pressedKeys = new Set();
+
+// Initialize keyboard controls
+export function initControls() {
+    // Add event listeners
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+    
+    // Focus the game container
+    const gameContainer = document.getElementById('game-container');
+    if (gameContainer) {
+        gameContainer.addEventListener('click', () => {
+            gameContainer.focus();
+        });
+        gameContainer.focus();
+    }
+    
+    // console.log("Controls initialized with keymap:", keyMap);
+}
+
+// Handle key down event
+function handleKeyDown(event) {
+    // Handle function keys (F1-F9)
+    if (event.key.startsWith('F')) {
+        const functionNum = event.key.toLowerCase().replace('f', '');
+        pressedKeys.add(functionNum);
+        // console.log(`Function key pressed: ${event.key} -> ${functionNum}`);
+        event.preventDefault();
+        return;
+    }
+    
+    const key = event.key.toLowerCase();
+    pressedKeys.add(key);
+    
+    // Debug key presses
+    // console.log("Key pressed:", key);
+}
+
+// Handle key up event
+function handleKeyUp(event) {
+    // Handle function keys (F1-F9)
+    if (event.key.startsWith('F')) {
+        const functionNum = event.key.toLowerCase().replace('f', '');
+        pressedKeys.delete(functionNum);
+        event.preventDefault();
+        return;
+    }
+    
+    const key = event.key.toLowerCase();
+    pressedKeys.delete(key);
+}
+
+// Check if a key is pressed
+export function isKeyPressed(controlName) {
+    const key = keyMap[controlName];
+    return pressedKeys.has(key);
+}
+
+// Check if any of the given keys are pressed
+export function anyKeyPressed(controlNames) {
+    return controlNames.some(name => isKeyPressed(name));
+}
+
+// Get all currently pressed keys
+export function getPressedKeys() {
+    return pressedKeys;
+}
+
+// Apply flight controls to player ship
+
+export function applyFlightControls(playerShip, deltaTime) {
+    if (!playerShip) return;
+    
+    // Roll controls
+    if (isKeyPressed('rollLeft')) {
+        playerShip.userData.rollRate = -Math.PI / 2;
+        // console.log("Rolling left:", playerShip.userData.rollRate);
+    } else if (isKeyPressed('rollRight')) {
+        playerShip.userData.rollRate = Math.PI / 2;
+        // console.log("Rolling right:", playerShip.userData.rollRate);
+    } else {
+        const previousRollRate = playerShip.userData.rollRate;
+        playerShip.userData.rollRate *= 0.95; // Dampen roll
+        // console.log("Damping roll from", previousRollRate, "to", playerShip.userData.rollRate);
+    }
+
+    // Pitch controls
+    if (isKeyPressed('pitchUp')) {
+        playerShip.userData.pitchRate = -Math.PI / 2;
+        // console.log("Pitching up:", playerShip.userData.pitchRate);
+    } else if (isKeyPressed('pitchDown')) {
+        playerShip.userData.pitchRate = Math.PI / 2;
+        // console.log("Pitching down:", playerShip.userData.pitchRate);
+    } else {
+        const previousPitchRate = playerShip.userData.pitchRate;
+        playerShip.userData.pitchRate *= 0.95; // Dampen pitch
+        // console.log("Damping pitch from", previousPitchRate, "to", playerShip.userData.pitchRate);
+    }
+
+    // Speed controls
+    if (isKeyPressed('speedUp')) {
+        const previousSpeed = playerShip.userData.speed;
+        playerShip.userData.speed = Math.min(
+            playerShip.userData.speed + 10 * deltaTime, 
+            playerShip.userData.maxSpeed
+        );
+        // console.log("Speeding up from", previousSpeed, "to", playerShip.userData.speed);
+    } else if (isKeyPressed('speedDown')) {
+        const previousSpeed = playerShip.userData.speed;
+        playerShip.userData.speed = Math.max(
+            playerShip.userData.speed - 10 * deltaTime, 
+            0
+        );
+        // console.log("Slowing down from", previousSpeed, "to", playerShip.userData.speed);
+    } else {
+        const previousSpeed = playerShip.userData.speed;
+        playerShip.userData.speed *= 0.98; // Inertial dampening
+        // console.log("Applying inertial dampening: speed from", previousSpeed, "to", playerShip.userData.speed);
+    }
+}
+
+// Clean up event listeners
+export function cleanupControls() {
+    window.removeEventListener('keydown', handleKeyDown);
+    window.removeEventListener('keyup', handleKeyUp);
+}
+File: ./effects.js
+// effects.js - Visual effects like explosions
+
+import { playExplosionSound } from './audio.js';
+import { addToScene, removeFromScene } from './rendering.js';
+
+// Create explosion effect at a position
+export function createExplosion(position, particleCount = 30) {
+    const particles = [];
+    
+    for (let i = 0; i < particleCount; i++) {
+        // Random direction
+        const direction = new THREE.Vector3(
+            Math.random() - 0.5,
+            Math.random() - 0.5,
+            Math.random() - 0.5
+        ).normalize();
+        
+        // Random speed and lifetime
+        const speed = 5 + Math.random() * 15;
+        const lifetime = 1 + Math.random();
+        
+        // Create particle
+        const geometry = new THREE.SphereGeometry(0.5 + Math.random() * 1.5, 4, 4);
+        const material = new THREE.MeshBasicMaterial({ 
+            color: Math.random() > 0.5 ? 0xff6600 : 0xffcc00
+        });
+        
+        const particle = new THREE.Mesh(geometry, material);
+        particle.position.copy(position);
+        
+        // Store particle properties
+        particle.userData = {
+            direction,
+            speed,
+            lifetime
+        };
+        
+        // Add to scene
+        addToScene(particle);
+        particles.push(particle);
+        
+        // Play explosion sound (but not for every particle)
+        if (i % 5 === 0) {
+            playExplosionSound();
+        }
+    }
+    
+    // Update and remove particles
+    updateParticles(particles);
+    
+    return particles;
+}
+
+// Update explosion particles
+function updateParticles(particles) {
+    if (particles.length === 0) return;
+    
+    let allExpired = true;
+    
+    for (let i = particles.length - 1; i >= 0; i--) {
+        const particle = particles[i];
+        
+        // Reduce lifetime
+        particle.userData.lifetime -= 0.016; // Approx 60fps
+        
+        if (particle.userData.lifetime > 0) {
+            allExpired = false;
+            
+            // Move particle
+            particle.position.add(
+                particle.userData.direction.clone().multiplyScalar(
+                    particle.userData.speed * 0.016
+                )
+            );
+            
+            // Slow down and fade
+            particle.userData.speed *= 0.98;
+            particle.scale.multiplyScalar(0.98);
+        } else {
+            // Remove expired particle
+            removeFromScene(particle);
+            particles.splice(i, 1);
+        }
+    }
+    
+    // Continue updating if particles remain
+    if (!allExpired) {
+        requestAnimationFrame(() => updateParticles(particles));
+    }
+}
+
+// Create laser hit effect
+export function createLaserHitEffect(position) {
+    // Create a small sphere as hit effect
+    const hitEffect = new THREE.Mesh(
+        new THREE.SphereGeometry(2),
+        new THREE.MeshBasicMaterial({ color: 0xffff00 })
+    );
+    hitEffect.position.copy(position);
+    addToScene(hitEffect);
+    
+    // Remove after a short time
+    setTimeout(() => removeFromScene(hitEffect), 100);
+    
+    return hitEffect;
+}
+
+// Create hyperspace effect
+export function createHyperspaceEffect(position, direction) {
+    const particles = [];
+    const particleCount = 100;
+    
+    // Create particles flying past the player
+    for (let i = 0; i < particleCount; i++) {
+        // Position along the direction vector
+        const distance = Math.random() * 1000;
+        const spread = 200;
+        
+        const offset = new THREE.Vector3(
+            (Math.random() - 0.5) * spread,
+            (Math.random() - 0.5) * spread,
+            (Math.random() - 0.5) * spread
+        );
+        
+        const pos = position.clone().add(
+            direction.clone().multiplyScalar(distance).add(offset)
+        );
+        
+        // Create streaking particle
+        const length = 10 + Math.random() * 40;
+        const geometry = new THREE.BufferGeometry();
+        const vertices = [
+            pos.x, pos.y, pos.z,
+            pos.x - direction.x * length, pos.y - direction.y * length, pos.z - direction.z * length
+        ];
+        geometry.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+        
+        const material = new THREE.LineBasicMaterial({ 
+            color: 0xaaaaff, 
+            opacity: 0.7,
+            transparent: true
+        });
+        
+        const line = new THREE.Line(geometry, material);
+        
+        // Store properties
+        line.userData = {
+            speed: 50 + Math.random() * 100,
+            lifetime: 1 + Math.random() * 2
+        };
+        
+        // Add to scene
+        addToScene(line);
+        particles.push(line);
+    }
+    
+    // Update and remove particles
+    updateHyperspaceParticles(particles, direction);
+    
+    return particles;
+}
+
+// Update hyperspace particles
+function updateHyperspaceParticles(particles, direction) {
+    if (particles.length === 0) return;
+    
+    let allExpired = true;
+    
+    for (let i = particles.length - 1; i >= 0; i--) {
+        const particle = particles[i];
+        
+        // Reduce lifetime
+        particle.userData.lifetime -= 0.016; // Approx 60fps
+        
+        if (particle.userData.lifetime > 0) {
+            allExpired = false;
+            
+            // Move particle along direction
+            particle.position.add(
+                direction.clone().multiplyScalar(particle.userData.speed * 0.016)
+            );
+            
+            // Update opacity
+            particle.material.opacity = Math.min(1, particle.userData.lifetime);
+        } else {
+            // Remove expired particle
+            removeFromScene(particle);
+            particles.splice(i, 1);
+        }
+    }
+    
+    // Continue updating if particles remain
+    if (!allExpired) {
+        requestAnimationFrame(() => updateHyperspaceParticles(particles, direction));
+    }
+}
+File: ./trade.js
+// trade.js - Trading mechanics
+
+import { playSound } from './audio.js';
+import { basePrices, CONSTANTS, galaxy, goods } from './config.js';
+import { gameState } from './gameState.js';
+import { showNotification } from './ui.js';
+
+// Generate market prices for a system
+export function generateMarket(systemIndex) {
+    const system = galaxy[systemIndex];
+    const market = [];
+    
+    for (let i = 0; i < goods.length; i++) {
+        // Calculate price with economic factors and randomness
+        const price = basePrices[i] * (1 + (system.economy - 3) * 0.1 + (Math.random() - 0.5) * 0.2);
+        
+        // Calculate availability based on economy
+        const availability = Math.floor(Math.random() * 50 * (7 - system.economy));
+        
+        // Add to market
+        market.push({ 
+            name: goods[i], 
+            price: price.toFixed(1), 
+            availability 
+        });
+    }
+    
+    return market;
+}
+
+// Buy goods
+export function buy(goodIndex, amount) {
+    const market = generateMarket(gameState.get('currentSystem'));
+    const item = market[goodIndex];
+    const cost = parseFloat(item.price) * amount;
+    const totalCargo = gameState.getTotalCargo();
+    
+    // Check if purchase is valid
+    if (gameState.get('cash') >= cost && 
+        totalCargo + amount <= gameState.get('cargoCapacity') && 
+        item.availability >= amount) {
+        
+        // Process purchase
+        gameState.subtractCash(cost);
+        gameState.addCargo(goodIndex, amount);
+        playSound(550, 100);
+        
+        // Show success notification
+        showNotification(
+            `Bought ${amount}t of ${item.name} for ${cost.toFixed(1)} CR`,
+            '#0f0',
+            2000
+        );
+        
+        return true;
+    } else {
+        // Show error notification
+        let errorMessage = "";
+        
+        if (gameState.get('cash') < cost) {
+            errorMessage = `Not enough credits. Need ${cost.toFixed(1)} CR`;
+        } else if (totalCargo + amount > gameState.get('cargoCapacity')) {
+            errorMessage = `Not enough cargo space. ${gameState.getAvailableCargoSpace()}t available`;
+        } else {
+            errorMessage = `Only ${item.availability}t available to buy`;
+        }
+        
+        showNotification(errorMessage, '#f00', 2000);
+        return false;
+    }
+}
+
+// Sell goods
+export function sell(goodIndex, amount) {
+    const market = generateMarket(gameState.get('currentSystem'));
+    const item = market[goodIndex];
+    const cargo = gameState.get('cargo');
+    
+    if (cargo[goodIndex] >= amount) {
+        const profit = parseFloat(item.price) * amount;
+        
+        // Process sale
+        gameState.addCash(profit);
+        gameState.removeCargo(goodIndex, amount);
+        playSound(660, 100);
+        
+        // Show success notification
+        showNotification(
+            `Sold ${amount}t of ${item.name} for ${profit.toFixed(1)} CR`,
+            '#0f0',
+            2000
+        );
+        
+        return true;
+    } else {
+        // Show error notification
+        showNotification(
+            `Not enough ${item.name} to sell`,
+            '#f00',
+            2000
+        );
+        
+        return false;
+    }
+}
+
+// Buy fuel
+export function buyFuel(amount) {
+    const fuelPrice = CONSTANTS.FUEL_PRICE;
+    const cost = amount * fuelPrice;
+    const maxFuel = CONSTANTS.MAX_FUEL;
+    
+    if (gameState.get('cash') >= cost && gameState.get('fuel') + amount <= maxFuel) {
+        // Process fuel purchase
+        gameState.subtractCash(cost);
+        gameState.addFuel(amount);
+        playSound(550, 100);
+        
+        // Show success notification
+        showNotification(
+            `Bought ${amount/10} LY of fuel for ${cost.toFixed(1)} CR`,
+            '#0f0',
+            2000
+        );
+        
+        return true;
+    } else {
+        // Show error notification
+        let errorMessage = "";
+        
+        if (gameState.get('cash') < cost) {
+            errorMessage = `Not enough credits. Need ${cost.toFixed(1)} CR`;
+        } else {
+            errorMessage = `Fuel tank capacity exceeded. ${(maxFuel - gameState.get('fuel'))/10} LY available`;
+        }
+        
+        showNotification(errorMessage, '#f00', 2000);
+        return false;
+    }
+}
+File: ./rendering.js
+// rendering.js - Three.js setup and rendering
+
+import { views } from './config.js';
+
+// Setup Three.js scene, camera, and renderer
+let scene, camera, renderer;
+let currentView = 'front';
+let cameraOffset = new THREE.Vector3(0, 5, 10); // Store current camera offset
+let cameraRotation = new THREE.Euler(0, 0, 0);    // new variable to store the view's rotation
+
+
+export function initRenderer() {
+    // Create Three.js scene
+    scene = new THREE.Scene();
+    
+    // Create camera with wide view distance
+    camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 5000);
+    
+    // Create renderer
+    renderer = new THREE.WebGLRenderer();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    
+    // Add renderer to DOM
+    document.getElementById('three-canvas').appendChild(renderer.domElement);
+    
+    // Set initial camera view - but don't try to use gameState here
+    setView('front');
+    
+    // Add resize handler
+    window.addEventListener('resize', handleResize);
+    
+    return { scene, camera, renderer };
+}
+
+// Update camera view
+export function setView(viewName) {
+    if (!views[viewName]) {
+        console.error("View not found:", viewName);
+        return currentView;
+    }
+    
+    const view = views[viewName];
+    
+    // Store the view offset and rotation
+    cameraOffset = new THREE.Vector3(...view.position);
+    cameraRotation = new THREE.Euler(...view.rotation);
+    
+    // Log the change for debugging
+    console.log(`View changed to ${viewName}:`, 
+                "Offset:", cameraOffset.toArray().map(n => n.toFixed(2)).join(", "),
+                "Rotation:", [cameraRotation.x, cameraRotation.y, cameraRotation.z].map(n => n.toFixed(2)).join(", "));
+    
+    // Update current view
+    currentView = viewName;
+    
+    // We removed the reference to gameState since it's causing circular dependency
+    
+    return currentView;
+}
+
+// Apply the current view to the camera
+export function updateCameraPosition(playerShip) {
+    if (!camera || !playerShip) return;
+    
+    // Detach camera if needed
+    if (camera.parent) {
+        const worldPosition = new THREE.Vector3();
+        const worldQuaternion = new THREE.Quaternion();
+        const worldScale = new THREE.Vector3();
+        
+        camera.getWorldPosition(worldPosition);
+        camera.getWorldQuaternion(worldQuaternion);
+        camera.getWorldScale(worldScale);
+        
+        camera.parent.remove(camera);
+        scene.add(camera);
+        
+        camera.position.copy(worldPosition);
+        camera.quaternion.copy(worldQuaternion);
+        camera.scale.copy(worldScale);
+    }
+    
+    // Get the ship's current world position
+    const shipWorldPosition = new THREE.Vector3();
+    playerShip.getWorldPosition(shipWorldPosition);
+    
+    // Set the camera's position relative to the ship using the fixed offset (from setView)
+    camera.position.copy(shipWorldPosition).add(cameraOffset);
+    
+    // Compute the look direction using the fixed camera rotation (do not mix in the ship’s quaternion)
+    const lookDirection = new THREE.Vector3(0, 0, -1).applyEuler(cameraRotation);
+    const targetPosition = camera.position.clone().add(lookDirection);
+    camera.lookAt(targetPosition);
+    
+    // Optional: Log for debugging purposes (only logs occasionally)
+    if (Math.random() < 0.01) {
+        console.log("Camera updated - Position:", camera.position.toArray().map(n => n.toFixed(2)).join(", "),
+                   "Looking at:", targetPosition.toArray().map(n => n.toFixed(2)).join(", "));
+    }
+}
+
+
+// Handle window resize
+function handleResize() {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+}
+
+// Render function
+export function render() {
+    if (!scene || !camera || !renderer) {
+        console.error("Can't render: scene, camera, or renderer is missing");
+        return;
+    }
+    
+    // Ensure matrices are up to date
+    scene.updateMatrixWorld();
+    
+    // Render the scene
+    renderer.render(scene, camera);
+}
+
+// Add object to scene
+export function addToScene(object) {
+    scene.add(object);
+}
+
+// Remove object from scene
+export function removeFromScene(object) {
+    scene.remove(object);
+}
+
+// Get scene
+export function getScene() {
+    return scene;
+}
+
+// Get camera
+export function getCamera() {
+    return camera;
+}
+
+// Get renderer
+export function getRenderer() {
+    return renderer;
+}
+
+// Get current view
+export function getCurrentView() {
+    return currentView;
+}
+
+// Create line model from vertices and edges
+export function createLineModel(vertices, edges, color = 0xffffff) {
+    const positions = [];
+    
+    edges.forEach(edge => {
+        const v1 = vertices[edge[0]];
+        const v2 = vertices[edge[1]];
+        positions.push(v1[0], v1[1], v1[2], v2[0], v2[1], v2[2]);
+    });
+    
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    const material = new THREE.LineBasicMaterial({ color });
+    
+    return new THREE.LineSegments(geometry, material);
+}
+File: ./config.js
+// config.js - Game constants and configuration
+
+// Trade goods
+export const goods = [
+    "Food", "Textiles", "Radioactives", "Slaves", "Liquor/Wines",
+    "Luxuries", "Narcotics", "Computers", "Machinery", "Alloys",
+    "Firearms", "Furs", "Minerals", "Gold", "Platinum", "Gem-Stones", "Alien Items"
+];
+
+// Base prices for goods
+export const basePrices = [
+    19, 27, 65, 42, 82,
+    92, 112, 105, 56, 78,
+    124, 180, 32, 350, 650, 850, 1000
+];
+
+// Galaxy systems
+export const galaxy = [
+    { name: "Lave", economy: 3, government: 1, techlevel: 4 },
+    { name: "Riedquat", economy: 1, government: 2, techlevel: 3 },
+    { name: "Diso", economy: 4, government: 1, techlevel: 5 },
+    { name: "Leesti", economy: 5, government: 4, techlevel: 7 },
+    { name: "Zaonce", economy: 6, government: 3, techlevel: 7 }
+];
+
+// Keyboard control mapping
+export const controls = {
+    rollLeft: ',',           // < (comma)
+    rollRight: '.',          // > (period)
+    pitchUp: 'x',            // X
+    pitchDown: 's',          // S
+    speedUp: ' ',            // Space
+    speedDown: '/',          // ? (slash)
+    fireLaser: 'a',          // A
+    targetMissile: 't',      // T
+    fireMissile: 'm',        // M
+    unarmMissile: 'u',       // U
+    hyperspace: 'h',         // H
+    dock: 'c',               // C
+    launch: 'l',             // f0
+    viewFront: '1',          // f0
+    viewBack: '2',           // f1
+    viewLeft: '3',           // f2
+    viewRight: '4',          // f3
+    market: '7',             // f7
+    inventory: '9',          // f9
+    status: '8'              // f8
+};
+
+// Camera view positions
+export const views = {
+    front: { 
+        position: [0, 5, 10], 
+        rotation: [0, 0, 0] // Looks along -Z (ship's forward direction after initial rotation)
+    },
+    back: { 
+        position: [0, 5, -10], 
+        rotation: [0, Math.PI, 0] // Looks along +Z (180° around Y)
+    },
+    left: { 
+        position: [-10, 5, 0], 
+        rotation: [0, -Math.PI / 2, 0] // Looks along -X (-90° around Y)
+    },
+    right: { 
+        position: [10, 5, 0], 
+        rotation: [0, Math.PI / 2, 0] // Looks along +X (90° around Y)
+    }
+};
+
+// Game constants
+export const CONSTANTS = {
+    STARFIELD_COUNT: 1000,
+    STARFIELD_SIZE: 2000,
+    STATION_DISTANCE: 500,
+    MAX_FUEL: 70,
+    FUEL_PRICE: 2.0,
+    MAX_SHIELDS: 255,
+    MAX_ENERGY: 255,
+    SHIELD_REGEN_RATE: 0.5,
+    ENERGY_REGEN_RATE: 1.0,
+    SHIP_AI_SPAWN_COUNT: 5,
+    SHIP_RESPAWN_DISTANCE: 1000,
+    COLLISION_THRESHOLD: 50,
+    STATION_ROTATION_SPEED: 0.05
+};
+File: ./main.js
+// main.js - Entry point, initializes everything
+
+import { updateShipAI } from './ai.js';
+import { initAudio } from './audio.js';
+import { cancelMissileTargeting, fireLaser, fireMissile, startMissileTargeting, updateLasers } from './combat.js';
+import { CONSTANTS } from './config.js';
+import { applyFlightControls, initControls, isKeyPressed } from './controls.js';
+import { createHyperspaceEffect } from './effects.js';
+import { gameState } from './gameState.js';
+import { canDock, checkCollisions } from './physics.js';
+import { getCamera, getScene, initRenderer, render, setView, updateCameraPosition } from './rendering.js';
+import { initScanner, updateScanner } from './scanner.js';
+import { createPlayerShip, createStation, getShips, spawnRandomShips, updateShipPosition } from './ship.js';
+import { createStarfield, updateStarfield } from './starfield.js';
+import { hidePanels, initUI, showInventoryPanel, showMarketPanel, showNotification, showStatusPanel, updateUI } from './ui.js';
+
+
+
+// Ensure THREE is available
+const THREE = window.THREE;
+
+
+
+// Animation loop
+let animationId;
+const clock = new THREE.Clock();
+
+// Key state tracking for UI panels to avoid multiple toggles per keypress
+let marketKeyWasPressed = false;
+let inventoryKeyWasPressed = false;
+let statusKeyWasPressed = false;
+let viewFrontKeyWasPressed = false;
+let viewBackKeyWasPressed = false;
+let viewLeftKeyWasPressed = false;
+let viewRightKeyWasPressed = false;
+
+// Debug flag - set to true for console logs
+const DEBUG = true;
+
+// Initialize the game
+export function initGame() {
+    console.log("Initializing Elite JS game...");
+    
+    if (!window.THREE) {
+        console.error("THREE.js is not loaded. Check your script imports.");
+        return;
+    }
+    
+    if (!window.shipBlueprints) {
+        console.error("Error: shipBlueprints is not defined. Ensure blueprints.js is loaded.");
+        return;
+    }
+    
+    const { scene, camera, renderer } = initRenderer();
+    if (!scene || !camera || !renderer) {
+        console.error("Failed to initialize renderer components");
+        return;
+    }
+    
+    initControls();
+    initAudio();
+    initUI();
+    initScanner();
+    
+    const playerShip = createPlayerShip();
+    if (!playerShip) {
+        console.error("Failed to create player ship");
+        return;
+    }
+    
+    const station = createStation();
+    if (!station) {
+        console.error("Failed to create station");
+        return;
+    }
+    
+    const stars = createStarfield();
+    
+    gameState.playerShip = playerShip;
+    gameState.station = station;
+    
+    camera.position.set(0, 5, 10);
+    camera.lookAt(0, 0, -10);
+
+    
+    setView('front');
+    
+    spawnRandomShips(CONSTANTS.SHIP_AI_SPAWN_COUNT, gameState.playerShip); // Update this too
+    
+    
+    startGameLoop();
+    
+    window.buy = (goodIndex, amount) => import('./trade.js').then(m => m.buy(goodIndex, amount));
+    window.sell = (goodIndex, amount) => import('./trade.js').then(m => m.sell(goodIndex, amount));
+    window.buyFuel = (amount) => import('./trade.js').then(m => m.buyFuel(amount));
+    window.setHyperspaceSystem = (index) => {
+        gameState.setHyperspaceSystem(index);
+        import('./ui.js').then(m => m.updateHyperspaceTarget(index));
+    };
+    
+    if (DEBUG) {
+        console.log("Player ship:", gameState.playerShip);
+        console.log("Station:", gameState.station);
+        console.log("Stars:", stars);
+        console.log("Test cube added at position (100, 0, -100) for camera rotation debugging");
+    }
+    
+    console.log("Game initialized successfully");
+    showNotification("Welcome Commander! Press Space to accelerate, '/' to slow down.", "#0F0", 4000);
+}
+    
+
+
+// Start the game loop
+function startGameLoop() {
+    animationId = requestAnimationFrame(gameLoop);
+    clock.start();
+    if (DEBUG) console.log("Game loop started");
+}
+
+// Main game loop
+
+
+function gameLoop() {
+    // Get elapsed time since last frame, cap it to prevent huge jumps
+    const deltaTime = Math.min(clock.getDelta(), 0.1);
+    
+    if (!gameState.get('docked')) {
+        // Player is flying
+        updateFlightMode(deltaTime);
+    } else {
+        // Player is docked
+        updateDockedMode();
+    }
+    
+    // Always update UI
+    updateUI(gameState);
+    
+    // IMPORTANT: Force scene update to ensure all positions are current
+    const scene = getScene();
+    if (scene) {
+        scene.updateMatrixWorld(true);
+    }
+    
+    // Render the scene (important!)
+    render();
+    
+    // Log to confirm we're rendering
+    if (DEBUG && Math.random() < 0.01) { // Only log occasionally to avoid flooding console
+        console.log("Game loop tick - deltaTime:", deltaTime);
+        if (gameState.playerShip) {
+            console.log("Ship position:", 
+                gameState.playerShip.position.x.toFixed(2),
+                gameState.playerShip.position.y.toFixed(2),
+                gameState.playerShip.position.z.toFixed(2),
+                "Speed:", gameState.playerShip.userData.speed.toFixed(2)
+            );
+        }
+    }
+    
+    // Continue the loop
+    animationId = requestAnimationFrame(gameLoop);
+}
+
+
+// Update game state when flying
+function updateFlightMode(deltaTime) {
+    // Apply flight controls to update ship's desired motion
+    applyFlightControls(gameState.playerShip, deltaTime);
+    
+    // Update player ship position based on current roll/pitch/speed
+    updateShipPosition(gameState.playerShip, deltaTime);
+    
+    // UPDATE CAMERA POSITION - ADD THIS LINE
+    updateCameraPosition(gameState.playerShip);
+    
+    // Update starfield based on player movement
+    updateStarfield(gameState.playerShip);
+    
+    // Check for collisions
+    checkCollisions(gameState.playerShip, gameState.station);
+    
+    // Update scanner (radar)
+    updateScanner(gameState.playerShip, gameState.station);
+    
+    // Handle combat actions
+    handleCombat();
+    
+    // Update lasers
+    updateLasers(deltaTime);
+    
+    // Handle hyperspace
+    handleHyperspace();
+    
+    // Regenerate shields and energy
+    gameState.regenShieldsAndEnergy(
+        deltaTime, 
+        CONSTANTS.SHIELD_REGEN_RATE, 
+        CONSTANTS.ENERGY_REGEN_RATE
+    );
+    
+    // Update AI ships
+    updateAIShips(deltaTime);
+    
+    // Handle docking
+    handleDocking();
+    
+    // Rotate station
+    if (gameState.station) {
+        gameState.station.rotation.z += CONSTANTS.STATION_ROTATION_SPEED * deltaTime;
+    }
+    
+    // Handle view changes
+    handleViewChanges();
+}
+
+// Update game state when docked
+function updateDockedMode() {
+    // Handle UI panels
+    handleDockUI();
+    
+    // Launch ship
+    if (isKeyPressed('launch')) {
+        if (DEBUG) console.log("Launch key pressed");
+
+        launchShip();
+    }
+    
+    // Hide panels with escape key
+    if (isKeyPressed('escape')) {
+        hidePanels();
+    }
+    
+    // Reset key states when keys are released
+    if (!isKeyPressed('market')) marketKeyWasPressed = false;
+    if (!isKeyPressed('inventory')) inventoryKeyWasPressed = false;
+    if (!isKeyPressed('status')) statusKeyWasPressed = false;
+    if (!isKeyPressed('viewFront')) viewFrontKeyWasPressed = false;
+    if (!isKeyPressed('viewBack')) viewBackKeyWasPressed = false;
+    if (!isKeyPressed('viewLeft')) viewLeftKeyWasPressed = false;
+    if (!isKeyPressed('viewRight')) viewRightKeyWasPressed = false;
+    
+    // Handle view changes
+    handleViewChanges();
+}
+
+// Handle view changes (front, back, left, right)
+function handleViewChanges() {
+    if (isKeyPressed('viewFront') && !viewFrontKeyWasPressed) {
+        viewFrontKeyWasPressed = true;
+        if (DEBUG) console.log("Switching to front view");
+        setView('front');
+    }
+    
+    if (isKeyPressed('viewBack') && !viewBackKeyWasPressed) {
+        viewBackKeyWasPressed = true;
+        if (DEBUG) console.log("Switching to back view");
+        setView('back');
+    }
+    
+    if (isKeyPressed('viewLeft') && !viewLeftKeyWasPressed) {
+        viewLeftKeyWasPressed = true;
+        if (DEBUG) console.log("Switching to left view");
+        setView('left');
+    }
+    
+    if (isKeyPressed('viewRight') && !viewRightKeyWasPressed) {
+        viewRightKeyWasPressed = true;
+        if (DEBUG) console.log("Switching to right view");
+        setView('right');
+    }
+}
+
+// Handle combat inputs
+function handleCombat() {
+    // Fire laser
+    if (isKeyPressed('fireLaser')) {
+        if (DEBUG) console.log("Fire laser key pressed");
+        const camera = getCamera();
+        if (!camera) {
+            console.error("Camera not available for fireLaser");
+        }
+        fireLaser(gameState.playerShip, gameState.playerShip);
+    }
+    
+    // Missile targeting
+    if (isKeyPressed('targetMissile')) {
+        if (DEBUG) console.log("Target missile key pressed");
+        startMissileTargeting();
+    }
+    
+    // Fire missile
+    if (isKeyPressed('fireMissile')) {
+        if (DEBUG) console.log("Fire missile key pressed");
+        fireMissile();
+    }
+    
+    // Unarm missile
+    if (isKeyPressed('unarmMissile')) {
+        if (DEBUG) console.log("Unarm missile key pressed");
+        cancelMissileTargeting();
+    }
+}
+
+// Handle hyperspace
+function handleHyperspace() {
+    if (isKeyPressed('hyperspace')) {
+        if (DEBUG) console.log("Hyperspace key pressed");
+        if (gameState.get('fuel') >= 10) {
+            const currentSystem = gameState.get('currentSystem');
+            const targetSystem = gameState.get('hyperspaceSystem');
+            
+            if (gameState.useFuel(10)) {
+                if (DEBUG) console.log(`Jumping from system ${currentSystem} to ${targetSystem}`);
+                
+                const direction = new THREE.Vector3(0, 0, -1).applyQuaternion(gameState.playerShip.quaternion);
+                createHyperspaceEffect(gameState.playerShip.position, direction);
+                
+                gameState.setCurrentSystem(targetSystem);
+                
+                gameState.playerShip.position.set(0, 0, 0);
+                gameState.station.position.set(0, 0, -CONSTANTS.STATION_DISTANCE);
+                
+                const ships = getShips();
+                while (ships.length > 0) {
+                    const ship = ships.pop();
+                    getScene().remove(ship);
+                }
+                spawnRandomShips(CONSTANTS.SHIP_AI_SPAWN_COUNT, gameState.playerShip);
+            }
+        } else {
+            if (DEBUG) console.log("Not enough fuel for hyperspace jump");
+        }
+    }
+}
+
+// Handle docking
+function handleDocking() {
+    if (isKeyPressed('dock')) {
+        if (DEBUG) console.log("Dock key pressed");
+        if (canDock(gameState.playerShip, gameState.station)) {
+            if (DEBUG) console.log("Docking successful");
+            gameState.dock();
+            gameState.playerShip.position.set(0, 0, 0);
+            gameState.station.position.set(0, 0, -CONSTANTS.STATION_DISTANCE);
+        } else {
+            if (DEBUG) console.log("Cannot dock - not in position or moving too fast");
+        }
+    }
+}
+
+// Handle UI when docked
+function handleDockUI() {
+    // Handle Market panel toggle with key state tracking
+    if (isKeyPressed('market') && !marketKeyWasPressed) {
+        marketKeyWasPressed = true;
+        if (DEBUG) console.log("Market key pressed");
+        const marketPanel = document.getElementById('market');
+        
+        if (marketPanel.style.display === 'block') {
+            hidePanels();
+        } else {
+            hidePanels(); // Hide any other panels first
+            showMarketPanel();
+        }
+    }
+    
+    // Handle Inventory panel toggle with key state tracking
+    if (isKeyPressed('inventory') && !inventoryKeyWasPressed) {
+        inventoryKeyWasPressed = true;
+        if (DEBUG) console.log("Inventory key pressed");
+        const inventoryPanel = document.getElementById('inventory');
+        
+        if (inventoryPanel.style.display === 'block') {
+            hidePanels();
+        } else {
+            hidePanels(); // Hide any other panels first
+            showInventoryPanel();
+        }
+    }
+    
+    // Handle Status panel toggle with key state tracking
+    if (isKeyPressed('status') && !statusKeyWasPressed) {
+        statusKeyWasPressed = true;
+        if (DEBUG) console.log("Status key pressed");
+        const statusPanel = document.getElementById('status');
+        
+        if (statusPanel.style.display === 'block') {
+            hidePanels();
+        } else {
+            hidePanels(); // Hide any other panels first
+            showStatusPanel();
+        }
+    }
+}
+
+// Launch ship from station
+function launchShip() {
+    if (DEBUG) console.log("Launching ship from station");
+    gameState.launch();
+    gameState.playerShip.position.set(0, 0, -400);
+    hidePanels(); // Hide any open UI panels
+    setView('front'); // Reset to front view
+}
+
+// Update AI ships
+function updateAIShips(deltaTime) {
+    const ships = getShips();
+    ships.forEach(ship => {
+        updateShipAI(ship, gameState.playerShip, deltaTime);
+        updateShipPosition(ship, deltaTime);
+    });
+}
+
+// Stop the game loop
+export function stopGame() {
+    cancelAnimationFrame(animationId);
+    if (DEBUG) console.log("Game stopped");
+}
+
+// Initialize game when document is loaded
+document.addEventListener('DOMContentLoaded', initGame);
+File: ./audio.js
+// audio.js - Sound effects
+
+// Audio context
+let audioContext;
+
+// Initialize audio system
+export function initAudio() {
+    // Create audio context
+    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    
+    return audioContext;
+}
+
+// Play a sound with specified frequency and duration
+export function playSound(frequency, duration, type = 'sine', volume = 0.5) {
+    if (!audioContext) {
+        initAudio();
+    }
+    
+    // Create oscillator
+    const oscillator = audioContext.createOscillator();
+    oscillator.type = type;
+    oscillator.frequency.value = frequency;
+    
+    // Create gain node for volume
+    const gainNode = audioContext.createGain();
+    gainNode.gain.value = volume;
+    
+    // Connect nodes
+    oscillator.connect(gainNode);
+    gainNode.connect(audioContext.destination);
+    
+    // Play sound
+    oscillator.start();
+    setTimeout(() => oscillator.stop(), duration);
+    
+    return oscillator;
+}
+
+// Play laser sound
+export function playLaserSound(isPlayerLaser = true) {
+    return playSound(isPlayerLaser ? 440 : 330, 100, 'sine', 0.3);
+}
+
+// Play explosion sound
+export function playExplosionSound() {
+    // Random pitch for variation
+    const frequency = 100 + Math.random() * 50;
+    return playSound(frequency, 300, 'sawtooth', 0.4);
+}
+
+// Play hyperspace sound
+export function playHyperspaceSound() {
+    return playSound(220, 1000, 'sine', 0.5);
+}
+
+// Play trade sound (buy)
+export function playBuySound() {
+    return playSound(550, 100, 'sine', 0.3);
+}
+
+// Play trade sound (sell)
+export function playSellSound() {
+    return playSound(660, 100, 'sine', 0.3);
+}
+
+// Play collision sound
+export function playCollisionSound() {
+    return playSound(100, 300, 'sawtooth', 0.4);
+}
+
+// Play missile targeting sound
+export function playMissileTargetingSound() {
+    return playSound(880, 200, 'sine', 0.3);
+}
+
+// Play missile launch sound
+export function playMissileLaunchSound() {
+    return playSound(660, 300, 'sine', 0.4);
+}
+
+// Get audio context
+export function getAudioContext() {
+    if (!audioContext) {
+        initAudio();
+    }
+    return audioContext;
+}
+File: ./ship.js
+// ship.js - Ship creation and management
+
+import { addToScene, createLineModel, removeFromScene } from './rendering.js';
+
+// Ensure THREE is available
+const THREE = window.THREE;
+
+// Collection of ships in the game
+const ships = [];
+
+// Create a ship from blueprint
+export function createShip(type) {
+    if (!window.shipBlueprints || !window.shipBlueprints[type]) {
+        console.error(`Ship blueprint not found for type: ${type}`);
+        return null;
+    }
+
+    const blueprint = window.shipBlueprints[type];
+    const model = createLineModel(blueprint.vertices, blueprint.edges);
+    
+    // Create ship container
+    const ship = new THREE.Group();
+    ship.add(model);
+    
+    // Add ship properties from blueprint
+    ship.userData = {
+        type,
+        speed: 0,
+        maxSpeed: blueprint.maxSpeed,
+        energy: blueprint.energy,
+        maxEnergy: blueprint.energy,
+        laserPower: blueprint.laserPower,
+        missiles: blueprint.missiles,
+        bounty: blueprint.bounty,
+        rollRate: 0,
+        pitchRate: 0,
+        alive: true,
+        aiState: 'idle',
+        target: null,
+        lastShotTime: 0,
+        visibilityDistance: blueprint.visibilityDistance || 30,
+        explosionCount: blueprint.explosionCount || 30
+    };
+    
+    return ship;
+}
+
+// Create the player's ship
+export function createPlayerShip(type = "Cobra Mk III (Trader)") {
+    const playerShip = createShip(type);
+    if (!playerShip) return null;
+    
+    // Align forward direction with negative z axis
+    playerShip.rotation.y = Math.PI;
+
+    // Add to scene
+    addToScene(playerShip);
+    
+    return playerShip;
+}
+
+// Create a space station
+export function createStation(type = "Coriolis", position = [0, 0, -500]) {
+    const station = createShip(type);
+    if (!station) return null;
+    
+    // Position the station
+    station.position.set(...position);
+    
+    // Add to scene
+    addToScene(station);
+    
+    return station;
+}
+
+// Add a ship to the ships collection
+export function addShip(ship) {
+    ships.push(ship);
+    return ships.length - 1; // Return index
+}
+
+// Remove a ship from the collection and scene
+export function removeShip(ship) {
+    const index = ships.indexOf(ship);
+    if (index !== -1) {
+        ships.splice(index, 1);
+    }
+    removeFromScene(ship);
+}
+
+// Spawn a number of random AI ships
+export function spawnRandomShips(count, playerShip, excludeTypes = ["Cobra Mk III (Trader)", "Coriolis", "Missile", "Escape Pod", "Cargo Canister"]) {
+    const spawnedShips = [];
+    
+    // Get available ship types
+    const shipTypes = Object.keys(window.shipBlueprints).filter(type => 
+        !excludeTypes.includes(type)
+    );
+    
+    if (shipTypes.length === 0) {
+        console.error("No valid ship types available for spawning");
+        return [];
+    }
+    
+    for (let i = 0; i < count; i++) {
+        // Choose random ship type
+        const type = shipTypes[Math.floor(Math.random() * shipTypes.length)];
+        const ship = createShip(type);
+        
+        if (ship) {
+            // Position relative to player if available
+            if (playerShip) {
+                const randomDirection = new THREE.Vector3(
+                    Math.random() - 0.5,
+                    Math.random() - 0.5,
+                    Math.random() - 0.5
+                ).normalize();
+                
+                ship.position.copy(playerShip.position.clone().add(
+                    randomDirection.multiplyScalar(500 + Math.random() * 500)
+                ));
+            } else {
+                // Otherwise random position
+                ship.position.set(
+                    (Math.random() - 0.5) * 1000,
+                    (Math.random() - 0.5) * 1000,
+                    (Math.random() - 0.5) * 1000
+                );
+            }
+            
+            // Random rotation
+            ship.quaternion.setFromEuler(new THREE.Euler(
+                Math.random() * Math.PI * 2,
+                Math.random() * Math.PI * 2,
+                Math.random() * Math.PI * 2
+            ));
+            
+            // Add to scene and collection
+            addToScene(ship);
+            addShip(ship);
+            spawnedShips.push(ship);
+        }
+    }
+    
+    return spawnedShips;
+}
+
+// Update ship position based on velocity and rotation
+export function updateShipPosition(ship, deltaTime) {
+    if (!ship) return;
+    
+    // Apply rotation
+    ship.rotation.z += ship.userData.rollRate * deltaTime;
+    ship.rotation.x += ship.userData.pitchRate * deltaTime;
+    
+    // Apply inertial dampening
+    ship.userData.rollRate *= 0.95;
+    ship.userData.pitchRate *= 0.95;
+    
+    // Move forward based on speed
+    const direction = new THREE.Vector3(0, 0, -1).applyQuaternion(ship.quaternion);
+    ship.position.add(direction.multiplyScalar(ship.userData.speed * deltaTime));
+    
+    // Ensure the matrix is updated
+    ship.updateMatrix();
+    ship.updateMatrixWorld(true);
+    
+    // Log position occasionally for AI ships to verify movement
+    if (ship.userData.type !== "Cobra Mk III (Trader)" && Math.random() < 0.01) {
+        // console.log(`${ship.userData.type} position:`, 
+        //    ship.position.x.toFixed(2), 
+        //    ship.position.y.toFixed(2), 
+        //    ship.position.z.toFixed(2),
+        //    "Speed:", ship.userData.speed.toFixed(2)
+        //);
+    }
+}
+
+// Get all ships
+export function getShips() {
+    return ships;
+}
+File: ./starfield.js
+// starfield.js - Star rendering and animation
+
+import { CONSTANTS } from './config.js';
+import { addToScene } from './rendering.js';
+
+// Stars in the scene
+let stars;
+
+// Create starfield
+export function createStarfield() {
+    const starGeometry = new THREE.BufferGeometry();
+    const starCount = CONSTANTS.STARFIELD_COUNT;
+    const starPositions = new Float32Array(starCount * 3);
+    
+    // Generate random stars
+    for (let i = 0; i < starCount * 3; i += 3) {
+        starPositions[i] = (Math.random() - 0.5) * CONSTANTS.STARFIELD_SIZE;
+        starPositions[i + 1] = (Math.random() - 0.5) * CONSTANTS.STARFIELD_SIZE;
+        starPositions[i + 2] = (Math.random() - 0.5) * CONSTANTS.STARFIELD_SIZE;
+    }
+    
+    starGeometry.setAttribute('position', new THREE.BufferAttribute(starPositions, 3));
+    const starMaterial = new THREE.PointsMaterial({ color: 0xffffff, size: 1 });
+    stars = new THREE.Points(starGeometry, starMaterial);
+    
+    // Add stars to scene
+    addToScene(stars);
+    
+    return stars;
+}
+
+// Update starfield based on player movement
+export function updateStarfield(playerShip) {
+    if (!stars || !playerShip) return;
+    
+    // Make stars move relative to player ship movement
+    const playerDirection = new THREE.Vector3(0, 0, -1).applyQuaternion(playerShip.quaternion);
+    const playerVelocity = playerDirection.clone().multiplyScalar(playerShip.userData.speed);
+    
+    // Update star positions
+    const positions = stars.geometry.attributes.position.array;
+    let needsReset = false;
+    
+    for (let i = 0; i < positions.length; i += 3) {
+        // Move stars in the opposite direction of player movement
+        // Adjust the movement factor for more noticeable star movement
+        const movementFactor = 0.05;  // Increased from 0.01 for more visible movement
+        
+        positions[i] -= playerVelocity.x * movementFactor;
+        positions[i + 1] -= playerVelocity.y * movementFactor;
+        positions[i + 2] -= playerVelocity.z * movementFactor;
+        
+        // Check if star is too far and needs to be reset
+        const x = positions[i];
+        const y = positions[i + 1];
+        const z = positions[i + 2];
+        const distance = Math.sqrt(x*x + y*y + z*z);
+        
+        if (distance > CONSTANTS.STARFIELD_SIZE / 2) {
+            needsReset = true;
+            // Create a new star in the direction opposite to player movement
+            const newPos = playerDirection.clone().multiplyScalar(-CONSTANTS.STARFIELD_SIZE / 2);
+            
+            // Add some randomness to the new position
+            positions[i] = newPos.x + (Math.random() - 0.5) * 400;
+            positions[i + 1] = newPos.y + (Math.random() - 0.5) * 400;
+            positions[i + 2] = newPos.z + (Math.random() - 0.5) * 400;
+        }
+    }
+    
+    // Only update the geometry if changes were made
+    if (needsReset) {
+        stars.geometry.attributes.position.needsUpdate = true;
+    }
+}
+
+// Get stars object
+export function getStars() {
+    return stars;
+}
+File: ./physics.js
+// physics.js - Collision detection and physics
+
+import { playCollisionSound } from './audio.js';
+import { damageShip } from './combat.js';
+import { CONSTANTS } from './config.js';
+import { getShips } from './ship.js';
+
+// Check collisions between ships and station
+export function checkCollisions(playerShip, station) {
+    if (!playerShip || !station) return;
+    
+    // Player-station collision
+    checkPlayerStationCollision(playerShip, station);
+    
+    // Player-ship collisions
+    checkPlayerShipCollisions(playerShip);
+}
+
+// Check collision between player and station
+function checkPlayerStationCollision(playerShip, station) {
+    const stationDistance = playerShip.position.distanceTo(station.position);
+    
+    // If close enough to station and moving slowly, allow docking
+    if (stationDistance < 50 && playerShip.userData.speed < 5) {
+        // Enable docking with C key handled elsewhere
+    } 
+    // Collision with station at high speed
+    else if (stationDistance < 150 && playerShip.userData.speed > 5) {
+        damageShip(playerShip, 50 + playerShip.userData.speed, false);
+        playCollisionSound();
+    }
+}
+
+// Check collisions between player and AI ships
+function checkPlayerShipCollisions(playerShip) {
+    const ships = getShips();
+    
+    ships.forEach(ship => {
+        if (ship.userData.alive) {
+            const distance = playerShip.position.distanceTo(ship.position);
+            
+            if (distance < CONSTANTS.COLLISION_THRESHOLD) {
+                // Collision damage proportional to relative speed
+                const relativeSpeed = playerShip.userData.speed + ship.userData.speed;
+                damageShip(playerShip, relativeSpeed * 5, false);
+                damageShip(ship, relativeSpeed * 5, false);
+                playCollisionSound();
+                
+                // Push ships apart
+                pushShipsApart(playerShip, ship);
+            }
+        }
+    });
+}
+
+// Push two ships apart after collision
+function pushShipsApart(ship1, ship2) {
+    const pushDirection = new THREE.Vector3().subVectors(
+        ship1.position, ship2.position
+    ).normalize();
+    
+    ship1.position.add(pushDirection.clone().multiplyScalar(10));
+    ship2.position.add(pushDirection.clone().multiplyScalar(-10));
+}
+
+// Calculate distance between two objects
+export function getDistance(obj1, obj2) {
+    return obj1.position.distanceTo(obj2.position);
+}
+
+// Check if object is in front of ship
+export function isInFrontOfShip(ship, object) {
+    // Get forward vector
+    const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(ship.quaternion);
+    
+    // Get vector to object
+    const toObject = new THREE.Vector3().subVectors(object.position, ship.position).normalize();
+    
+    // Calculate dot product (positive if in front)
+    const dotProduct = forward.dot(toObject);
+    
+    return dotProduct > 0;
+}
+
+// Check if player is close enough to dock with station
+export function canDock(playerShip, station) {
+    const distance = getDistance(playerShip, station);
+    const speed = playerShip.userData.speed;
+    
+    return distance < 50 && speed < 5;
+}
